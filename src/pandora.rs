@@ -29,8 +29,12 @@ fn command_dragon(command_name: &str, args: &mut env::Args) -> Result<()> {
     })?;
 
     if let Some(token) = token {
+        // NOTE: the port makes the name unique, so several dragons can attack at the same time
+        let port = server.local_addr().map_err(|err| {
+            eprintln!("ERROR: could not get local address of connection to {address}: {err}");
+        })?.port();
         println!("INFO: Sending token...");
-        write!(&server, "{token}").map_err(|err| {
+        server.write_all(format!("{token} dragon{port}").as_bytes()).map_err(|err| {
             eprintln!("ERROR: could not authorize with the token: {err}");
         })?;
     }

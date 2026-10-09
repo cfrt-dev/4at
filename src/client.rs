@@ -328,6 +328,9 @@ impl Prompt {
 #[derive(Default)]
 struct Client {
     stream: Option<TcpStream>,
+    name: String,
+    // Bytes received from the server that do not form a complete line yet
+    incoming: Vec<u8>,
     chat: ChatLog,
     quit: bool,
 }
@@ -336,11 +339,14 @@ fn connect_command(client: &mut Client, argument: &str) {
     if client.stream.is_none() {
         let chunks: Vec<&str> = argument.split(' ').filter(|s| !s.is_empty()).collect();
         match &chunks[..] {
-            &[ip, token] => {
+            &[ip, token, name] => {
+                client.name = name.to_string();
+                client.incoming.clear();
                 client.stream = TcpStream::connect(&format!("{ip}:6969"))
                     .and_then(|mut stream| {
                         stream.set_nonblocking(true)?;
-                        stream.write(token.as_bytes())?;
+                        // NOTE: the server expects the token and the name together in the very first message
+                        stream.write_all(format!("{token} {name}").as_bytes())?;
                         Ok(stream)
                     })
                     .map_err(|err| {
@@ -350,7 +356,7 @@ fn connect_command(client: &mut Client, argument: &str) {
             }
             _ => {
                 // TODO: get the signature of the command from COMMANDS
-                chat_error!(&mut client.chat, "Incorrect usage of connect command. Try /connect <ip> <token>");
+                chat_error!(&mut client.chat, "Incorrect usage of connect command. Try /connect <ip> <token> <name>");
             }
         }
     } else {
@@ -398,8 +404,8 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "connect",
         run: connect_command,
-        description: "Connect to a server by <ip> with authorization <token>",
-        signature: "/connect <ip> <token>",
+        description: "Connect to a server by <ip> with authorization <token> under the <name>",
+        signature: "/connect <ip> <token> <name>",
     },
     Command {
         name: "disconnect",
@@ -531,7 +537,7 @@ fn main() -> io::Result<()> {
                                     // TODO: don't display the message if it was not delivered
                                     // Maybe the server should actually send your own message back.
                                     // Not sending it back made sense in the telnet times.
-                                    chat_msg!(&mut client.chat, "{text}", text = &prompt);
+                                    chat_msg!(&mut client.chat, "{name}: {text}", name = client.name, text = &prompt);
                                 } else {
                                     chat_info!(&mut client.chat, "You are offline. Use {signature} to connect to a server.", signature = find_command("connect").expect("connect command").signature);
                                 }
@@ -546,20 +552,31 @@ fn main() -> io::Result<()> {
         }
 
         if let Some(ref mut s) = &mut client.stream {
-            match s.read(&mut buf) {
-                Ok(n) => {
-                    if n > 0 {
-                        if let Some(line) = sanitize_terminal_output(&buf[..n]) {
-                            client.chat.push(line, Color::White)
-                        }
-                    } else {
+            // NOTE: the server may send many lines at once (like the chat history), so we read until
+            // there is nothing left and split the received bytes by newlines
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => {
                         client.stream = None;
                         chat_info!(&mut client.chat, "Server closed the connection");
+                        break;
                     }
-                }
-                Err(err) => if err.kind() != ErrorKind::WouldBlock {
-                    client.stream = None;
-                    chat_error!(&mut client.chat, "Connection Error: {err}");
+                    Ok(n) => {
+                        client.incoming.extend_from_slice(&buf[..n]);
+                        while let Some(i) = client.incoming.iter().position(|x| *x == b'\n') {
+                            let line: Vec<u8> = client.incoming.drain(..=i).collect();
+                            if let Some(line) = sanitize_terminal_output(&line) {
+                                client.chat.push(line, Color::White)
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.kind() != ErrorKind::WouldBlock {
+                            client.stream = None;
+                            chat_error!(&mut client.chat, "Connection Error: {err}");
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -577,12 +594,12 @@ fn main() -> io::Result<()> {
             });
         }
         let status_label = if client.stream.is_some() {
-            "Status: Online"
+            format!("Status: Online as {name}", name = client.name)
         } else {
-            "Status: Offline"
+            "Status: Offline".to_string()
         };
         if let Some(h) = h.checked_sub(2) {
-            status_bar(&mut buf_curr, status_label, 0, h as usize, w.into());
+            status_bar(&mut buf_curr, &status_label, 0, h as usize, w.into());
         }
         if let Some(y) = h.checked_sub(1) {
             let x = 1;

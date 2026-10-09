@@ -2,13 +2,13 @@ use std::net::{IpAddr, SocketAddr, Shutdown};
 use std::result;
 use std::io::{Read, Write};
 use std::fmt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, Duration};
 use std::str;
 use getrandom::getrandom;
 use std::fmt::Write as OtherWrite;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Poll, Interest, Token, Events};
 
@@ -20,6 +20,11 @@ const BAN_LIMIT: Duration = Duration::from_secs(10*60);
 const MESSAGE_RATE: Duration = Duration::from_secs(1);
 const SLOWLORIS_LIMIT: Duration = Duration::from_millis(200);
 const STRIKE_LIMIT: usize = 10;
+// NOTE: the token, a space and the name must fit into a single read buffer of client_read()
+const NAME_LIMIT: usize = 24;
+const HISTORY_FILE_PATH: &str = "./HISTORY";
+// How many of the most recent messages are kept in memory and sent to the newly authorized clients
+const HISTORY_LIMIT: usize = 100;
 
 struct Sens<T>(T);
 
@@ -39,6 +44,7 @@ struct Client {
     last_message: SystemTime,
     connected_at: SystemTime,
     authed: bool,
+    name: String,
     addr: SocketAddr,
 }
 
@@ -72,18 +78,55 @@ impl Sinner {
     }
 }
 
+struct History {
+    messages: VecDeque<String>,
+    file: File,
+}
+
+impl History {
+    fn open(file_path: &str) -> Result<Self> {
+        let file = OpenOptions::new().read(true).append(true).create(true).open(file_path).map_err(|err| {
+            eprintln!("ERROR: could not open chat history file {file_path}: {err}");
+        })?;
+        let mut messages = VecDeque::new();
+        for line in BufReader::new(&file).lines() {
+            let line = line.map_err(|err| {
+                eprintln!("ERROR: could not read chat history file {file_path}: {err}");
+            })?;
+            if messages.len() >= HISTORY_LIMIT {
+                messages.pop_front();
+            }
+            messages.push_back(line);
+        }
+        Ok(Self { messages, file })
+    }
+
+    fn push(&mut self, message: String) {
+        // NOTE: the whole line is written in one go, so a message never ends up half-saved next to another one
+        let _ = self.file.write_all(format!("{message}\n").as_bytes()).map_err(|err| {
+            eprintln!("ERROR: could not save message to the chat history: {err}");
+        });
+        if self.messages.len() >= HISTORY_LIMIT {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(message);
+    }
+}
+
 struct Server {
     clients: HashMap<Token, Client>,
     sinners: HashMap<IpAddr, Sinner>,
     token: String,
+    history: History,
 }
 
 impl Server {
-    fn from_token(token: String) -> Self {
+    fn new(token: String, history: History) -> Self {
         Self {
             clients: HashMap::new(),
             sinners: HashMap::new(),
             token,
+            history,
         }
     }
 
@@ -122,6 +165,7 @@ impl Server {
             last_message: now - 2*MESSAGE_RATE,
             connected_at: now,
             authed: false,
+            name: String::new(),
             addr: author_addr,
         });
     }
@@ -168,37 +212,78 @@ impl Server {
             self.sinners.entry(author_addr.ip()).or_insert(Sinner::new()).forgive();
             author.last_message = now;
             if author.authed {
+                let message = format!("{name}: {text}", name = author.name);
                 println!("INFO: Client {author_addr} sent message {bytes:?}", author_addr = Sens(author_addr));
                 for (client_token, client) in self.clients.iter_mut() {
                     if *client_token != token && client.authed {
-                        let _ = writeln!(client.conn, "{text}").map_err(|err| {
+                        let _ = writeln!(client.conn, "{message}").map_err(|err| {
                             eprintln!("ERROR: could not broadcast message to all the clients from {author_addr}: {err}", author_addr = Sens(author_addr), err = Sens(err))
                         });
                     }
                 }
+                self.history.push(message);
             } else {
-                if text != self.token {
-                    // TODO: let the user know that they were banned after this attempt
-                    println!("INFO: {} failed authorization!", Sens(author_addr));
-                    let _ = writeln!(author.conn, "Invalid token! Bruh!").map_err(|err| {
-                        eprintln!("ERROR: could not notify client {} about invalid token: {}", Sens(author_addr), Sens(err));
-                    });
-                    let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
-                        eprintln!("ERROR: could not shutdown {}: {}", Sens(author_addr), Sens(err));
-                    });
-                    self.clients.remove(&token);
-                    // TODO: each IP strike must be properly documented in the source code giving the reasoning
-                    // behind it.
-                    self.strike_ip(author_addr.ip());
-                    return;
-                }
-
-                author.authed = true;
-                println!("INFO: {} authorized!", Sens(author_addr));
-                let _ = writeln!(author.conn, "Welcome to the Club buddy!").map_err(|err| {
-                    eprintln!("ERROR: could not send welcome message to {}: {}", Sens(author_addr), Sens(err));
-                });
+                self.client_authorize(token, text);
             }
+        }
+    }
+
+    fn name_error(&self, name: &str) -> Option<String> {
+        if name.is_empty() || name.len() > NAME_LIMIT || !name.chars().all(|x| x.is_ascii_alphanumeric() || x == '_' || x == '-') {
+            Some(format!("Invalid name! It must be 1-{NAME_LIMIT} characters long and contain only letters, digits, `_` or `-`"))
+        } else if self.clients.values().any(|client| client.authed && client.name == name) {
+            Some(format!("Name {name} is already taken!"))
+        } else {
+            None
+        }
+    }
+
+    // The first message of the client is expected to be `<token> <name>`
+    fn client_authorize(&mut self, token: Token, text: &str) {
+        let (access_token, name) = text.split_once(' ').unwrap_or((text, ""));
+        let name_error = self.name_error(name);
+        if let Some(author) = self.clients.get_mut(&token) {
+            let author_addr: SocketAddr = author.addr.clone();
+            if access_token != self.token {
+                // TODO: let the user know that they were banned after this attempt
+                println!("INFO: {} failed authorization!", Sens(author_addr));
+                let _ = writeln!(author.conn, "Invalid token! Bruh!").map_err(|err| {
+                    eprintln!("ERROR: could not notify client {} about invalid token: {}", Sens(author_addr), Sens(err));
+                });
+                let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
+                    eprintln!("ERROR: could not shutdown {}: {}", Sens(author_addr), Sens(err));
+                });
+                self.clients.remove(&token);
+                // TODO: each IP strike must be properly documented in the source code giving the reasoning
+                // behind it.
+                self.strike_ip(author_addr.ip());
+                return;
+            }
+
+            // NOTE: a bad name is not striked, because only the clients that know the token get that far
+            if let Some(name_error) = name_error {
+                println!("INFO: {} picked a bad name: {name_error}", Sens(author_addr));
+                let _ = writeln!(author.conn, "{name_error}").map_err(|err| {
+                    eprintln!("ERROR: could not notify client {} about bad name: {}", Sens(author_addr), Sens(err));
+                });
+                let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
+                    eprintln!("ERROR: could not shutdown {}: {}", Sens(author_addr), Sens(err));
+                });
+                self.clients.remove(&token);
+                return;
+            }
+
+            author.authed = true;
+            author.name = name.to_string();
+            println!("INFO: {} authorized as {name}!", Sens(author_addr));
+            let mut greeting = String::new();
+            for message in self.history.messages.iter() {
+                let _ = writeln!(&mut greeting, "{message}");
+            }
+            let _ = writeln!(&mut greeting, "Welcome to the Club {name}!");
+            let _ = author.conn.write_all(greeting.as_bytes()).map_err(|err| {
+                eprintln!("ERROR: could not send welcome message to {}: {}", Sens(author_addr), Sens(err));
+            });
         }
     }
 
@@ -270,6 +355,8 @@ fn main() -> Result<()> {
     })?;
 
     println!("INFO: check {token_file_path} file for the token");
+    let history = History::open(HISTORY_FILE_PATH)?;
+    println!("INFO: chat history is saved to {HISTORY_FILE_PATH}, loaded {n} recent messages", n = history.messages.len());
     let address = format!("0.0.0.0:{PORT}");
     let mut listener = TcpListener::bind(address.parse().unwrap()).map_err(|err| {
         eprintln!("ERROR: could not bind {address}: {err}", address = Sens(&address), err = Sens(err))
@@ -284,7 +371,7 @@ fn main() -> Result<()> {
         eprintln!("ERROR: Could not register server socket in the Poll object: {err}")
     })?;
 
-    let mut server = Server::from_token(token);
+    let mut server = Server::new(token, history);
 
     println!("INFO: listening to {}", Sens(address));
     loop {

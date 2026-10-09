@@ -3,6 +3,7 @@ main
 server
 *.swp
 TOKEN
+HISTORY
 
 # Added by cargo
 
